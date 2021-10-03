@@ -17,6 +17,8 @@ libzlib_dep = dependency('zlib')
 libcairo_dep = dependency('cairo')
 graphene_dep = dependency('graphene-1.0')
 
+libx11_dep = dependency('x11')
+
 # Not required since not all platforms ship a separate libm.
 libm_dep = cc.find_library('m', required: false)
 

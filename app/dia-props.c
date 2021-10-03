@@ -1,9 +1,6 @@
 /* Dia -- an diagram creation/manipulation program
  * Copyright (C) 1998 Alexander Larsson
  *
- * dia-props.c - a dialog for the diagram properties
- * Copyright (C) 2000 James Henstridge
- *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -21,406 +18,1238 @@
 
 #include <config.h>
 
-#include "dia-props.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <string.h>
+#include <signal.h>
+#include <locale.h>
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
 
 #include <gtk/gtk.h>
+#include <gmodule.h>
+
+#include <libxml/parser.h>
+#include <libxml/xmlerror.h>
+
+#include <glib/gstdio.h>
 
 #include "intl.h"
+#include "app_procs.h"
+#include "object.h"
+#include "commands.h"
+#include "tool.h"
+#include "interface.h"
+#include "modify_tool.h"
+#include "group.h"
+#include "message.h"
 #include "display.h"
-#include "undo.h"
-#include "dia-builder.h"
-#include "dia-colour-selector.h"
+#include "layer-editor/layer_dialog.h"
+#include "load_save.h"
+#include "preferences.h"
+#include "dia_dirs.h"
+#include "sheet.h"
+#include "plug-ins.h"
+#include "recent_files.h"
+#include "authors.h"
+#include "autosave.h"
+#include "dynamic_refresh.h"
+#include "persistence.h"
+#include "sheet-editor/sheets.h"
+#include "exit_dialog.h"
+#include "dialib.h"
+#include "diaerror.h"
+#include "widgets.h"
+#include "dia-layer.h"
 
+/*https://stackoverflow.com/questions/18647475/threading-problems-with-gtk
+requires libx11-xcb-dev
+*/
+#include <X11/Xlib.h>
 
-typedef struct _DiaDiagramPropertiesDialogPrivate DiaDiagramPropertiesDialogPrivate;
-struct _DiaDiagramPropertiesDialogPrivate {
-  Diagram *diagram;
+static gboolean         handle_initial_diagram (const char *input_file_name,
+                                                const char *export_file_name,
+                                                const char *export_file_format,
+                                                const char *size,
+                                                char       *show_layers,
+                                                const char *outdir);
+static void             create_user_dirs       (void);
+static PluginInitResult internal_plugin_init   (PluginInfo *info);
+static gboolean         handle_all_diagrams    (GSList     *files,
+                                                char       *export_file_name,
+                                                char       *export_file_format,
+                                                char       *size,
+                                                char       *show_layers,
+                                                const char *input_dir,
+                                                const char *output_dir);
+static void             print_credits          (void);
+static void             print_filters_list     (gboolean verbose);
 
-  /* Grid */
-  GtkWidget *dynamic;
-  GtkWidget *manual;
-  GtkWidget *manual_props;
-  GtkWidget *hex;
-  GtkWidget *hex_props;
+static gboolean dia_is_interactive = FALSE;
 
-  GtkAdjustment *spacing_x;
-  GtkAdjustment *spacing_y;
-  GtkAdjustment *vis_spacing_x;
-  GtkAdjustment *vis_spacing_y;
-  GtkAdjustment *hex_size;
-
-  /* Colours */
-  GtkWidget *background;
-  GtkWidget *grid_lines;
-  GtkWidget *page_lines;
-  GtkWidget *guide_lines;
-};
-
-G_DEFINE_TYPE_WITH_PRIVATE (DiaDiagramPropertiesDialog, dia_diagram_properties_dialog, GTK_TYPE_DIALOG)
-
-enum {
-  PROP_0,
-  PROP_DIAGRAM,
-  LAST_PROP
-};
-
-static GParamSpec *pspecs[LAST_PROP] = { NULL, };
-
-
-static void
-dia_diagram_properties_dialog_set_property (GObject      *object,
-                                            guint         property_id,
-                                            const GValue *value,
-                                            GParamSpec   *pspec)
+static char *
+build_output_file_name(const char *infname, const char *format, const char *outdir)
 {
-  DiaDiagramPropertiesDialog *self = DIA_DIAGRAM_PROPERTIES_DIALOG (object);
+  const char *pe = strrchr(infname,'.');
+  const char *pp = strrchr(infname,G_DIR_SEPARATOR);
+  char *tmp;
+  if (!pp)
+    pp = infname;
+  else
+    pp += 1;
+  if (!pe)
+    return g_strconcat(outdir ? outdir : "", pp,".",format,NULL);
 
-  switch (property_id) {
-    case PROP_DIAGRAM:
-      dia_diagram_properties_dialog_set_diagram (self, g_value_get_object (value));
-      break;
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
-      break;
+  tmp = g_new0 (char, strlen (pp) + 1 + strlen (format) + 1);
+  memcpy(tmp,pp,pe-pp);
+  strcat(tmp,".");
+  strcat(tmp,format);
+
+  if (outdir) {
+    char *ret = g_strconcat(outdir, G_DIR_SEPARATOR_S, tmp, NULL);
+
+    g_clear_pointer (&tmp, g_free);
+
+    return ret;
+  }
+
+  return tmp;
+}
+
+/* Handle the string between commas. We have either of:
+ *
+ * 1. XX, the number XX
+ * 2. -XX, every number until XX
+ * 3. XX-, every number from XX until n_layers
+ * 4. XX-YY, every number between XX-YY
+ */
+static void
+show_layers_parse_numbers (DiagramData *diagdata,
+                           gboolean    *visible_layers,
+                           int          n_layers,
+                           const char  *str)
+{
+  char *p;
+  unsigned long int low = 0;
+  unsigned long int high = n_layers;
+  unsigned long int i;
+
+  if (str == NULL)
+    return;
+
+  /* Case 2, starts with '-' */
+  if (*str == '-') {
+    str++;
+    low = 0;
+    high = strtoul (str, &p, 10) + 1;
+    /* This must be a number (otherwise we would have called parse_name) */
+    g_assert (p != str);
+  } else {
+    /* Case 1, 3 or 4 */
+    low = strtoul (str, &p, 10);
+    high = low + 1; /* Assume case 1 */
+    g_assert (p != str);
+    if (*p == '-') {
+      /* Case 3 or 4 */
+      str = p + 1;
+      if (*str == '\0') {/* Case 3 */
+        high = n_layers;
+      } else {
+        high = strtoul (str, &p, 10) + 1;
+        g_assert (p != str);
+      }
+    }
+  }
+
+  if (high <= low) {
+    /* This is not an errror */
+    g_warning (_("invalid layer range %lu - %lu"), low, high - 1);
+    return;
+  }
+
+  if (high > n_layers) {
+    high = n_layers;
+  }
+
+  /* Set the visible layers */
+  for (i = low; i < high; i++) {
+    DiaLayer *lay = data_layer_get_nth (diagdata, i);
+
+    if (visible_layers[i] == TRUE) {
+      g_warning (_("Layer %lu (%s) selected more than once."),
+                 i,
+                 dia_layer_get_name (lay));
+    }
+    visible_layers[i] = TRUE;
   }
 }
 
 
 static void
-dia_diagram_properties_dialog_get_property (GObject    *object,
-                                            guint       property_id,
-                                            GValue     *value,
-                                            GParamSpec *pspec)
+show_layers_parse_word (DiagramData *diagdata,
+                        gboolean    *visible_layers,
+                        int          n_layers,
+                        const char  *str)
 {
-  DiaDiagramPropertiesDialog *self = DIA_DIAGRAM_PROPERTIES_DIALOG (object);
+  gboolean found = FALSE;
+  int len;
+  char *p;
+  const char *name;
 
-  switch (property_id) {
-    case PROP_DIAGRAM:
-      g_value_set_object (value, dia_diagram_properties_dialog_get_diagram (self));
-      break;
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
-      break;
+  /* Apply --show-layers=LAYER,LAYER,... switch. 13.3.2004 sampo@iki.fi */
+
+  DIA_FOR_LAYER_IN_DIAGRAM (diagdata, lay, k, {
+    name = dia_layer_get_name (lay);
+
+    if (name) {
+      len = strlen (name);
+      if ((p = strstr (str, name)) != NULL) {
+        if (((p == str) || (p[-1] == ','))    /* zap false positives */
+            && ((p[len] == 0) || (p[len] == ','))){
+          found = TRUE;
+          if (visible_layers[k] == TRUE) {
+            g_warning (_("Layer %d (%s) selected more than once."), k, name);
+          }
+          visible_layers[k] = TRUE;
+        }
+      }
+    }
+  });
+
+  if (found == FALSE) {
+    g_warning (_("There is no layer named %s."), str);
   }
+}
+
+static void
+show_layers_parse_string (DiagramData *diagdata,
+                          gboolean    *visible_layers,
+                          int          n_layers,
+                          const char  *str)
+{
+  gchar **pp;
+  int i;
+
+  pp = g_strsplit (str, ",", 100);
+
+  for (i = 0; pp[i]; i++) {
+    gchar *p = pp[i];
+
+    /* Skip the empty string */
+    if (strlen(p) == 0) {
+      continue;
+    }
+
+    /* If the string is only numbers and '-' chars, it is parsed as a
+     * number range. Otherwise it is parsed as a layer name.
+     */
+    if (strlen (p) != strspn (p, "0123456789-")) {
+      show_layers_parse_word (diagdata, visible_layers, n_layers, p);
+    } else {
+      show_layers_parse_numbers (diagdata, visible_layers, n_layers, p);
+    }
+  }
+
+  g_strfreev (pp);
 }
 
 
 static void
-diagram_died (gpointer data, GObject *dead)
+handle_show_layers (DiagramData *diagdata,
+                    const char  *show_layers)
 {
-  DiaDiagramPropertiesDialog *self = DIA_DIAGRAM_PROPERTIES_DIALOG (data);
-  DiaDiagramPropertiesDialogPrivate *priv = dia_diagram_properties_dialog_get_instance_private (self);
+  gboolean *visible_layers;
+  DiaLayer *layer;
+  int i;
 
-  g_return_if_fail (DIA_IS_DIAGRAM_PROPERTIES_DIALOG (data));
+  visible_layers = g_new (gboolean, data_layer_count (diagdata));
+  /* Assume all layers are non-visible */
+  for (i = 0; i < data_layer_count (diagdata); i++) {
+    visible_layers[i] = FALSE;
+  }
 
-  priv->diagram = NULL;
+  /* Split the layer-range by commas */
+  show_layers_parse_string (diagdata,
+                            visible_layers,
+                            data_layer_count (diagdata),
+                            show_layers);
 
-  dia_diagram_properties_dialog_set_diagram (self, NULL);
+  /* Set the visibility of the layers */
+  for (i = 0; i < data_layer_count (diagdata); i++) {
+    layer = data_layer_get_nth (diagdata, i);
+
+    if (visible_layers[i] == TRUE) {
+      dia_layer_set_visible (layer, TRUE);
+    } else {
+      dia_layer_set_visible (layer, FALSE);
+    }
+  }
+  g_clear_pointer (&visible_layers, g_free);
 }
 
 
-static void
-dia_diagram_properties_dialog_finalize (GObject *object)
-{
-  DiaDiagramPropertiesDialog *self = DIA_DIAGRAM_PROPERTIES_DIALOG (object);
-  DiaDiagramPropertiesDialogPrivate *priv = dia_diagram_properties_dialog_get_instance_private (self);
+const char *argv0 = NULL;
 
-  if (priv->diagram) {
-    g_object_weak_unref (G_OBJECT (priv->diagram), diagram_died, object);
+/*
+ * Convert infname to outfname, using input filter inf and export filter
+ * ef.  If either is null, try to guess them.
+ * size might be NULL.
+ */
+static gboolean
+do_convert (const char      *infname,
+            const char      *outfname,
+            DiaExportFilter *ef,
+            const char      *size,
+            char            *show_layers)
+{
+  DiaImportFilter *inf;
+  DiagramData     *diagdata = NULL;
+  DiaContext      *ctx;
+
+  inf = filter_guess_import_filter (infname);
+  if (!inf) {
+    inf = &dia_import_filter;
   }
 
-  G_OBJECT_CLASS (dia_diagram_properties_dialog_parent_class)->finalize (object);
+  if (ef == NULL) {
+    ef = filter_guess_export_filter (outfname);
+    if (!ef) {
+      g_critical (_("%s error: don't know how to export into %s\n"),
+                  argv0, outfname);
+      exit (1);
+    }
+  }
+
+  dia_is_interactive = FALSE;
+
+  if (0 == strcmp (infname,outfname)) {
+    g_critical (_("%s error: input and output filenames are identical: %s"),
+                argv0, infname);
+    exit (1);
+  }
+
+  diagdata = g_object_new (DIA_TYPE_DIAGRAM_DATA, NULL);
+  ctx = dia_context_new (_("Import"));
+
+  if (!inf->import_func (infname, diagdata, ctx, inf->user_data)) {
+    g_critical (_("%s error: need valid input file %s\n"),
+                argv0, infname);
+    exit (1);
+  }
+
+  /* Apply --show-layers */
+  if (show_layers) {
+    handle_show_layers (diagdata, show_layers);
+  }
+
+  /* recalculate before export */
+  data_update_extents (diagdata);
+
+  /* Do our best in providing the size to the filter, but don't abuse user_data
+   * too much for it. It _must not_ be changed after initialization and there
+   * are quite some filter selecting their output format by it. --hb
+   */
+  if (size) {
+    g_warning ("--size parameter unsupported for %s filter",
+               ef->unique_name ? ef->unique_name : "selected");
+    ef->export_func (diagdata, ctx, outfname, infname, ef->user_data);
+  } else {
+    ef->export_func (diagdata, ctx, outfname, infname, ef->user_data);
+  }
+  /* if (!quiet) */
+  g_printerr (_("%s --> %s\n"), infname, outfname);
+  g_clear_object (&diagdata);
+  dia_context_release (ctx);
+  return TRUE;
+}
+
+void debug_break (void); /* shut gcc up */
+int debug_break_dont_optimize = 1;
+void
+debug_break (void)
+{
+  if (debug_break_dont_optimize > 0) {
+    debug_break_dont_optimize -= 1;
+  }
+}
+
+static void
+dump_dependencies (void)
+{
+#ifdef __GNUC__
+  g_print ("Compiler: GCC " __VERSION__ "\n");
+#elif defined _MSC_VER
+  g_print ("Compiler: MSC %d\n", _MSC_VER);
+#else
+  g_print ("Compiler: unknown\n");
+#endif
+
+  /* print out all those dependies, both compile and runtime if possible
+   * Note: this is not meant to be complete but does only include libaries
+   * which may or have cause(d) us trouble in some versions
+   */
+  g_print ("Library versions (at compile time)\n");
+  {
+    const gchar* libxml_rt_version = "?";
+#if 0
+    /* this is stupid, does not compile on Linux:
+     * app_procs.c:504: error: expected identifier before '(' token
+     *
+     * In fact libxml2 has different ABI for LIBXML_THREAD_ENABLED, this code only compiles without
+     * threads enabled, but apparently it does only work when theay are.
+     */
+    xmlInitParser();
+    if (xmlGetGlobalState())
+      libxml_rt_version = xmlGetGlobalState()->xmlParserVersion;
+#endif
+    libxml_rt_version = xmlParserVersion;
+    if (atoi (libxml_rt_version)) {
+      g_print ("libxml  : %d.%d.%d (%s)\n",
+               atoi (libxml_rt_version) / 10000,
+               atoi (libxml_rt_version) / 100 % 100,
+               atoi (libxml_rt_version) % 100,
+               LIBXML_DOTTED_VERSION);
+    } else {   /* may include "extra" */
+      g_print ("libxml  : %s (%s)\n", libxml_rt_version ? libxml_rt_version : "??", LIBXML_DOTTED_VERSION);
+    }
+  }
+  g_print ("glib    : %d.%d.%d (%d.%d.%d)\n",
+           glib_major_version, glib_minor_version, glib_micro_version,
+           GLIB_MAJOR_VERSION, GLIB_MINOR_VERSION, GLIB_MICRO_VERSION);
+  g_print ("pango   : %s (%d.%d.%d)\n", pango_version_string(), PANGO_VERSION_MAJOR, PANGO_VERSION_MINOR, PANGO_VERSION_MICRO);
+  g_print ("cairo   : %s (%s)\n", cairo_version_string(), CAIRO_VERSION_STRING);
+  g_print ("gtk+    : %d.%d.%d (%d.%d.%d)\n",
+           gtk_major_version, gtk_minor_version, gtk_micro_version,
+           GTK_MAJOR_VERSION, GTK_MINOR_VERSION, GTK_MICRO_VERSION);
+}
+
+gboolean
+app_is_interactive (void)
+{
+  return dia_is_interactive;
+}
+
+/*
+ * Handle loading of diagrams given on command line, including conversions.
+ * Returns %TRUE if any automatic conversions were performed.
+ * Note to future hackers: 'size' is currently the only argument that can be
+ * sent to exporters. If more arguments are desired, please don't just add
+ * even more arguments, but create a more general system.
+ */
+static gboolean
+handle_initial_diagram (const char *in_file_name,
+                        const char *out_file_name,
+                        const char *export_file_format,
+                        const char *size,
+                        char       *show_layers,
+                        const char *outdir) {
+  Diagram *diagram = NULL;
+  gboolean made_conversions = FALSE;
+
+  if (export_file_format) {
+    char *export_file_name = NULL;
+    DiaExportFilter *ef = NULL;
+
+    /* First try guessing based on extension */
+    export_file_name = build_output_file_name (in_file_name,
+                                               export_file_format,
+                                               outdir);
+
+    ef = filter_guess_export_filter (export_file_name);
+    if (ef == NULL) {
+      ef = filter_export_get_by_name (export_file_format);
+      if (ef == NULL) {
+        g_critical (_("Can't find output format/filter %s"),
+                    export_file_format);
+        return FALSE;
+      }
+      g_clear_pointer (&export_file_name, g_free);
+      export_file_name = build_output_file_name (in_file_name,
+                                                 ef->extensions[0],
+                                                 outdir);
+    }
+    made_conversions |= do_convert (in_file_name,
+                                    (out_file_name != NULL ? out_file_name : export_file_name),
+                                    ef,
+                                    size,
+                                    show_layers);
+    g_clear_pointer (&export_file_name, g_free);
+  } else if (out_file_name) {
+    DiaExportFilter *ef = NULL;
+    made_conversions |= do_convert (in_file_name,
+                                    out_file_name,
+                                    ef,
+                                    size,
+                                    show_layers);
+  } else {
+    if (g_file_test (in_file_name, G_FILE_TEST_EXISTS)) {
+      diagram = diagram_load (in_file_name, NULL);
+    } else {
+      GFile *file = g_file_new_for_path (in_file_name);
+
+      diagram = dia_diagram_new (file);
+
+      g_clear_object (&file);
+    }
+
+    if (diagram != NULL) {
+      diagram_update_extents (diagram);
+      if (app_is_interactive ()) {
+        layer_dialog_set_diagram (diagram);
+        /* the display initial diagram holds two references */
+        new_display (diagram);
+      } else {
+        g_clear_object (&diagram);
+      }
+    }
+  }
+  return made_conversions;
+}
+
+#ifdef G_OS_WIN32
+/* Translators:  This is an option, not to be translated */
+#define WMF "wmf, "
+#else
+#define WMF ""
+#endif
+
+static const gchar *input_directory = NULL;
+static const gchar *output_directory = NULL;
+
+
+static gboolean
+_check_option_input_directory (const gchar    *option_name,
+                               const gchar    *value,
+                               gpointer        data,
+                               GError        **error)
+{
+  gchar *directory = g_filename_from_utf8 (value, -1, NULL, NULL, NULL);
+
+  if (g_file_test (directory, G_FILE_TEST_IS_DIR)) {
+    input_directory = directory;
+    return TRUE;
+  }
+  g_set_error (error, DIA_ERROR, DIA_ERROR_DIRECTORY,
+               _("Input directory '%s' must exist!\n"), directory);
+  g_clear_pointer (&directory, g_free);
+  return FALSE;
 }
 
 
 static gboolean
-dia_diagram_properties_dialog_delete_event (GtkWidget *widget, GdkEventAny *event)
+_check_option_output_directory (const gchar    *option_name,
+                                const gchar    *value,
+                                gpointer        data,
+                                GError        **error)
 {
-  gtk_widget_hide (widget);
+  gchar *directory = g_filename_from_utf8 (value, -1, NULL, NULL, NULL);
 
-  /* We're caching, so don't destroy */
-  return TRUE;
+  if (g_file_test (directory, G_FILE_TEST_IS_DIR)) {
+    output_directory = directory;
+    return TRUE;
+  }
+  g_set_error (error, DIA_ERROR, DIA_ERROR_DIRECTORY,
+               _("Output directory '%s' must exist!\n"), directory);
+  g_clear_pointer (&directory, g_free);
+  return FALSE;
 }
 
 
-static void
-dia_diagram_properties_dialog_response (GtkDialog *dialog,
-                                        int        response_id)
+void
+app_init (int argc, char **argv)
 {
-  DiaDiagramPropertiesDialog *self = DIA_DIAGRAM_PROPERTIES_DIALOG (dialog);
-  DiaDiagramPropertiesDialogPrivate *priv = dia_diagram_properties_dialog_get_instance_private (self);
+  static gboolean nosplash = FALSE;
+  static gboolean nonew = FALSE;
+  static gboolean use_integrated_ui = TRUE;
+  static gboolean credits = FALSE;
+  static gboolean list_filters = FALSE;
+  static gboolean version = FALSE;
+  static gboolean verbose = FALSE;
+  static gboolean log_to_stderr = FALSE;
+  static char *export_file_name = NULL;
+  static char *export_file_format = NULL;
+  static char *size = NULL;
+  static char *show_layers = NULL;
+  gboolean made_conversions = FALSE;
+  GSList *files = NULL;
+  static const gchar **filenames = NULL;
+  int i = 0;
+  GOptionContext *context = NULL;
+  static GOptionEntry options[] = {
+    {"export", 'e', 0, G_OPTION_ARG_FILENAME, NULL /* &export_file_name */,
+     N_("Export loaded file and exit"), N_("OUTPUT")},
+    {"filter", 't', 0, G_OPTION_ARG_STRING, NULL /* &export_file_format */,
+     N_("Select the export filter/format"), N_("TYPE") },
+    {"list-filters", 0, 0, G_OPTION_ARG_NONE, &list_filters,
+     N_("List export filters/formats and exit"), NULL},
+    {"size", 's', 0, G_OPTION_ARG_STRING, NULL,
+     N_("Export graphics size"), N_("WxH")},
+    {"show-layers", 'L', 0, G_OPTION_ARG_STRING, NULL,
+     N_("Show only specified layers (e.g. when exporting). Can be either the layer name or a range of layer numbers (X-Y)"),
+     N_("LAYER,LAYER,...")},
+    {"nosplash", 'n', 0, G_OPTION_ARG_NONE, &nosplash,
+     N_("Don't show the splash screen"), NULL },
+    {"nonew", 'n', 0, G_OPTION_ARG_NONE, &nonew,
+     N_("Don't create an empty diagram"), NULL },
+    {"classic", '\0', G_OPTION_FLAG_REVERSE, G_OPTION_ARG_NONE, &use_integrated_ui,
+     N_("Start classic user interface (no diagrams in tabs)"), NULL },
+    {"log-to-stderr", 'l', 0, G_OPTION_ARG_NONE, &log_to_stderr,
+     N_("Send error messages to stderr instead of showing dialogs."), NULL },
+    {"input-directory", 'I', 0, G_OPTION_ARG_CALLBACK, _check_option_input_directory,
+     N_("Directory containing input files"), N_("DIRECTORY")},
+    {"output-directory", 'O', 0, G_OPTION_ARG_CALLBACK, _check_option_output_directory,
+     N_("Directory containing output files"), N_("DIRECTORY")},
+    {"credits", 'c', 0, G_OPTION_ARG_NONE, &credits,
+     N_("Display credits list and exit"), NULL },
+    {"verbose", 0, 0, G_OPTION_ARG_NONE, &verbose,
+     N_("Generate verbose output"), NULL },
+    {"version", 'v', 0, G_OPTION_ARG_NONE, &version,
+     N_("Display version and exit"), NULL },
+    { G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_FILENAME_ARRAY, NULL /* &filenames */,
+      NULL, NULL },
+    { NULL }
+  };
+  char *localedir = dia_get_locale_directory ();
 
-  if (response_id == GTK_RESPONSE_OK ||
-      response_id == GTK_RESPONSE_APPLY) {
-    if (priv->diagram) {
-      /* we do not bother for the actual change, just record the
-       * whole possible change */
-      dia_mem_swap_change_new (priv->diagram,
-                               &priv->diagram->grid,
-                               sizeof(priv->diagram->grid));
-      dia_mem_swap_change_new (priv->diagram,
-                               &priv->diagram->data->bg_color,
-                               sizeof(priv->diagram->data->bg_color));
-      dia_mem_swap_change_new (priv->diagram,
-                               &priv->diagram->pagebreak_color,
-                               sizeof(priv->diagram->pagebreak_color));
-      dia_mem_swap_change_new (priv->diagram,
-                               &priv->diagram->guide_color,
-                               sizeof(priv->diagram->guide_color));
-      undo_set_transactionpoint (priv->diagram->undo);
+  /* for users of app_init() the default is interactive */
+  dia_is_interactive = TRUE;
 
-      priv->diagram->grid.dynamic =
-        gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (priv->dynamic));
-      priv->diagram->grid.width_x = gtk_adjustment_get_value (priv->spacing_x);
-      priv->diagram->grid.width_y = gtk_adjustment_get_value (priv->spacing_y);
-      priv->diagram->grid.visible_x = gtk_adjustment_get_value (priv->vis_spacing_x);
-      priv->diagram->grid.visible_y = gtk_adjustment_get_value (priv->vis_spacing_y);
-      priv->diagram->grid.hex =
-        gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (priv->hex));
-      priv->diagram->grid.hex_size = gtk_adjustment_get_value (priv->hex_size);
-      dia_colour_selector_get_colour (DIA_COLOUR_SELECTOR (priv->background),
-                                      &priv->diagram->data->bg_color);
-      dia_colour_selector_get_colour (DIA_COLOUR_SELECTOR (priv->grid_lines),
-                                      &priv->diagram->grid.colour);
-      dia_colour_selector_get_colour (DIA_COLOUR_SELECTOR (priv->page_lines),
-                                      &priv->diagram->pagebreak_color);
-      dia_colour_selector_get_colour (DIA_COLOUR_SELECTOR (priv->guide_lines),
-                                      &priv->diagram->guide_color);
-      diagram_add_update_all (priv->diagram);
-      diagram_flush (priv->diagram);
-      diagram_set_modified (priv->diagram, TRUE);
+  options[0].arg_data = &export_file_name;
+  options[1].arg_data = &export_file_format;
+  options[3].arg_data = &size;
+  options[4].arg_data = &show_layers;
+  g_return_if_fail (g_strcmp0 (options[14].long_name, G_OPTION_REMAINING) == 0);
+  options[14].arg_data = (void*)&filenames;
+
+  argv0 = (argc > 0) ? argv[0] : "(none)";
+
+  setlocale (LC_NUMERIC, "C");
+
+  bindtextdomain (GETTEXT_PACKAGE, localedir);
+  bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
+  textdomain (GETTEXT_PACKAGE);
+
+  g_clear_pointer (&localedir, g_free);
+
+  context = g_option_context_new (_("[FILE...]"));
+  g_option_context_add_main_entries (context, options, GETTEXT_PACKAGE);
+  /* avoid to add it a second time */
+  g_option_context_add_group (context, gtk_get_option_group (FALSE));
+  if (argv) {
+    GError *error = NULL;
+
+    if (!g_option_context_parse (context, &argc, &argv, &error)) {
+      if (error) { /* IMO !error here is a bug upstream, triggered e.g. with --gdk-debug=updates */
+        g_printerr ("%s", error->message);
+        g_clear_error (&error);
+      } else {
+        g_printerr (_("Invalid option?"));
+      }
+
+      g_clear_pointer (&context, g_option_context_free);
+      exit (1);
+    }
+
+    /* second level check of command line options, existance of input files etc. */
+    if (filenames) {
+      while (filenames[i] != NULL) {
+        char *filename;
+        char *testpath;
+
+        if (g_str_has_prefix (filenames[i], "file://")) {
+          filename = g_filename_from_uri (filenames[i], NULL, NULL);
+          if (!g_utf8_validate (filename, -1, NULL)) {
+            char *tfn = filename;
+            filename = g_filename_to_utf8 (filename, -1, NULL, NULL, NULL);
+            g_clear_pointer (&tfn, g_free);
+          }
+        } else {
+          filename = g_filename_to_utf8 (filenames[i], -1, NULL, NULL, NULL);
+        }
+
+        if (!filename) {
+          g_printerr (_("Filename conversion failed: %s\n"), filenames[i]);
+          ++i;
+          continue;
+        }
+
+        if (g_path_is_absolute (filename)) {
+          testpath = filename;
+        } else {
+          testpath = g_build_filename (input_directory ? input_directory : ".", filename, NULL);
+        }
+
+        /* we still have a problem here, if GLib's file name encoding would not be utf-8 */
+        if (g_file_test (testpath, G_FILE_TEST_IS_REGULAR)) {
+          files = g_slist_append (files, filename);
+        } else {
+          g_printerr (_("Missing input: %s\n"), filename);
+          g_clear_pointer (&filename, g_free);
+        }
+
+        if (filename != testpath) {
+          g_clear_pointer (&testpath, g_free);
+        }
+
+        ++i;
+      }
+    }
+    /* given some files to output (or something;)), we are not starting up the UI */
+    if (export_file_name || export_file_format || size || credits || version || list_filters) {
+      dia_is_interactive = FALSE;
     }
   }
 
-  if (response_id != GTK_RESPONSE_APPLY) {
-    gtk_widget_hide (GTK_WIDGET (dialog));
-  }
-}
+  if (argv && dia_is_interactive) {
+    GdkPixbuf *pixbuf;
 
+    /* FIXME: does not yet solves issue
+    dia: Fatal IO error 0 (Succes) on X server :0.
+    [xcb] Unknown sequence number while processing queue
+    [xcb] Most likely this is a multi-threaded client and XInitThreads has not been called
+    [xcb] Aborting, sorry about that.
+    dia: ../../src/xcb_io.c :263 : poll_for_event:  l'assertion  !xcb_xlib_threads_sequence_lost failed.
+    (ABORT signal sent from Glib 2.28 )
+    */   
+    XInitThreads();
 
-static void
-dia_diagram_properties_dialog_class_init (DiaDiagramPropertiesDialogClass *klass)
-{
-  GObjectClass *object_class = G_OBJECT_CLASS (klass);
-  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
-  GtkDialogClass *dialog_class = GTK_DIALOG_CLASS (klass);
+    g_set_application_name (_("Dia Diagram Editor"));
+    gtk_init (&argc, &argv);
 
-  object_class->set_property = dia_diagram_properties_dialog_set_property;
-  object_class->get_property = dia_diagram_properties_dialog_get_property;
-  object_class->finalize = dia_diagram_properties_dialog_finalize;
+    /* GTK: (Defunct with GtkApplication)
+     * gtk_icon_theme_add_resource_path (gtk_icon_theme_get_default (),
+     *                                   "/org/gnome/Dia/icons/");
+     */
 
-  widget_class->delete_event = dia_diagram_properties_dialog_delete_event;
-
-  dialog_class->response = dia_diagram_properties_dialog_response;
-
-  /**
-   * DiaDiagramPropertiesDialog:diagram:
-   *
-   * Since: 0.98
-   */
-  pspecs[PROP_DIAGRAM] =
-    g_param_spec_object ("diagram",
-                         "Diagram",
-                         "The current diagram",
-                         DIA_TYPE_DIAGRAM,
-                         G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY);
-
-  g_object_class_install_properties (object_class, LAST_PROP, pspecs);
-}
-
-
-static void
-update_sensitivity (GtkToggleButton *widget,
-                    gpointer         userdata)
-{
-  DiaDiagramPropertiesDialog *self = DIA_DIAGRAM_PROPERTIES_DIALOG (userdata);
-  DiaDiagramPropertiesDialogPrivate *priv = dia_diagram_properties_dialog_get_instance_private (self);
-  gboolean dyn_grid, square_grid, hex_grid;
-
-  if (!priv->diagram)
-    return; /* safety first */
-
-  priv->diagram->grid.dynamic =
-        gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (priv->dynamic));
-  dyn_grid = priv->diagram->grid.dynamic;
-  if (!dyn_grid) {
-    priv->diagram->grid.hex =
-        gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (priv->hex));
+    /* Set the icon for Dia windows & dialogs */
+    /* GTK3: Use icon-name with GResource fallback */
+    pixbuf = pixbuf_from_resource ("/org/gnome/Dia/icons/org.gnome.Dia.png");
+    if (pixbuf) {
+      gtk_window_set_default_icon (pixbuf);
+      g_clear_object (&pixbuf);
+    }
+  } else {
+    /*
+     * On Windows there is no command line without display so that gtk_init is harmless.
+     * On X11 we need gtk_init_check() to avoid exit() just because there is no display
+     * running outside of X11.
+     */
+    if (!gtk_init_check (&argc, &argv)) {
+      dia_log_message ("Running without display");
+    }
   }
 
-  square_grid = !dyn_grid && !priv->diagram->grid.hex;
-  hex_grid = !dyn_grid && priv->diagram->grid.hex;
+  if (version) {
+    char *ver_str;
 
+#if (defined __TIME__) && (defined __DATE__)
+    /* TRANSLATOR: 2nd and 3rd %s are time and date respectively. */
+    ver_str = g_strdup_printf (_("Dia version %s, compiled %s %s\n"), VERSION, __TIME__, __DATE__);
+#else
+    ver_str = g_strdup_printf (_("Dia version %s\n"), VERSION);
+#endif
 
-  gtk_widget_set_sensitive (priv->manual_props, square_grid);
-  gtk_widget_set_sensitive (priv->hex_props, hex_grid);
+    g_print ("%s\n", ver_str);
+
+    g_clear_pointer (&ver_str, g_free);
+
+    if (verbose) {
+      dump_dependencies ();
+    }
+
+    exit (0);
+  }
+
+  if (!dia_is_interactive) {
+    log_to_stderr = TRUE;
+  }
+
+  libdia_init ( (dia_is_interactive ? DIA_INTERACTIVE : 0)
+               |(log_to_stderr ? DIA_MESSAGE_STDERR : 0)
+               |(verbose ? DIA_VERBOSE : 0));
+
+  if (credits) {
+    print_credits ();
+    exit (0);
+  }
+
+  if (dia_is_interactive) {
+    create_user_dirs ();
+
+    if (!nosplash) {
+      app_splash_init ("");
+    }
+
+    /* Init cursors: */
+    default_cursor = gdk_cursor_new (GDK_LEFT_PTR);
+    ddisplay_set_all_cursor (default_cursor);
+  }
+
+  dia_register_plugins ();
+  dia_register_builtin_plugin (internal_plugin_init);
+
+  if (list_filters) {
+    print_filters_list (verbose);
+    exit (0);
+  }
+
+  load_all_sheets ();     /* new mechanism */
+
+  dia_log_message ("object defaults");
+  {
+    DiaContext *ctx = dia_context_new (_("Object Defaults"));
+    dia_object_defaults_load (NULL, TRUE /* prefs.object_defaults_create_lazy */, ctx);
+    dia_context_release (ctx);
+  }
+  debug_break ();
+
+  if (object_get_type ("Standard - Box") == NULL) {
+    message_error (_("Couldn't find standard objects when looking for "
+                     "object-libs; exiting..."));
+    g_critical (_("Couldn't find standard objects when looking for "
+                  "object-libs in â€œ%sâ€; exiting..."),
+                dia_get_lib_directory ());
+    exit (1);
+  }
+
+  persistence_load ();
+
+  /** Must load prefs after persistence */
+  dia_preferences_init ();
+
+  if (dia_is_interactive) {
+
+    /* further initialization *before* reading files */
+    active_tool = create_modify_tool ();
+
+    dia_log_message ("ui creation");
+    if (use_integrated_ui) {
+      create_integrated_ui ();
+    } else {
+      create_toolbox ();
+      /* for the integrated ui case it is integrated */
+      persistence_register_window_create ("layer_window",
+                                          (NullaryFunc*) &layer_dialog_create);
+    }
+
+    /*fill recent file menu */
+    recent_file_history_init ();
+
+    /* Set up autosave to check every 5 minutes */
+    g_timeout_add_seconds (5 * 60, autosave_check_autosave, NULL);
+
+#if 0 /* do we really open these automatically in the next session? */
+    persistence_register_window_create ("diagram_tree",
+                                        &diagram_tree_show);
+#endif
+    persistence_register_window_create ("sheets_main_dialog",
+                                        (NullaryFunc*) &sheets_dialog_create);
+
+    /* In current setup, we can't find the autosaved files. */
+    /*autosave_restore_documents();*/
+  }
+
+  dia_log_message ("diagrams");
+  made_conversions = handle_all_diagrams (files,
+                                          export_file_name,
+                                          export_file_format,
+                                          size,
+                                          show_layers,
+                                          input_directory,
+                                          output_directory);
+
+  if (dia_is_interactive && files == NULL && !nonew) {
+    GList *list;
+
+    file_new_callback (NULL);
+
+    list = dia_open_diagrams ();
+    if (list) {
+      Diagram *diagram = list->data;
+      diagram_update_extents (diagram);
+      diagram->is_default = TRUE;
+      layer_dialog_set_diagram (diagram);
+    }
+  }
+  g_slist_free (files);
+  if (made_conversions) {
+    exit (0);
+  }
+
+  dynobj_refresh_init ();
+  dia_log_message ("initialized");
 }
 
 
-static void
-dia_diagram_properties_dialog_init (DiaDiagramPropertiesDialog *self)
-{
-  DiaDiagramPropertiesDialogPrivate *priv = dia_diagram_properties_dialog_get_instance_private (self);
-  GtkWidget *dialog_vbox;
-  GtkWidget *notebook;
-  DiaBuilder *builder;
-
-  gtk_dialog_add_buttons (GTK_DIALOG (self),
-                          _("_Close"), GTK_RESPONSE_CANCEL,
-                          _("_Apply"), GTK_RESPONSE_APPLY,
-                          _("_OK"), GTK_RESPONSE_OK,
-                          NULL);
-  gtk_dialog_set_default_response (GTK_DIALOG (self), GTK_RESPONSE_OK);
-
-  dialog_vbox = gtk_dialog_get_content_area (GTK_DIALOG (self));
-
-  gtk_window_set_role (GTK_WINDOW (self), "diagram_properties");
-
-  g_signal_connect (G_OBJECT (self), "destroy",
-                    G_CALLBACK (gtk_widget_destroyed), &self);
-
-  /* Load UI */
-  builder = dia_builder_new ("ui/properties-dialog.ui");
-
-  dia_builder_get (builder,
-                   "notebook", &notebook,
-                   /* Grid Page */
-                   "dynamic", &priv->dynamic,
-                   "manual", &priv->manual,
-                   "manual_props", &priv->manual_props,
-                   "hex", &priv->hex,
-                   "hex_props", &priv->hex_props,
-                   "spacing_x", &priv->spacing_x,
-                   "spacing_y", &priv->spacing_y,
-                   "vis_spacing_x", &priv->vis_spacing_x,
-                   "vis_spacing_y", &priv->vis_spacing_y,
-                   "hex_size", &priv->hex_size,
-                   /* The background page */
-                   "background", &priv->background,
-                   "grid_lines", &priv->grid_lines,
-                   "page_lines", &priv->page_lines,
-                   "guide_lines", &priv->guide_lines,
-                   NULL);
-
-  gtk_box_pack_start (GTK_BOX (dialog_vbox), notebook, TRUE, TRUE, 0);
-
-  dia_builder_connect (builder,
-                       self,
-                       "update_sensitivity", G_CALLBACK (update_sensitivity),
-                       NULL);
-
-  g_clear_object (&builder);
-}
-
-
-/* diagram_properties_retrieve
- * Retrieves properties of a diagram *dia and sets the values in the
- * diagram properties dialog.
+/**
+ * app_exit:
+ *
+ * Exit the application, but asking the user for confirmation
+ * if there are changed diagrams.
+ *
+ * Returns: %TRUE if the application exits.
+ *
+ * Since: dawn-of-time
  */
-void
-dia_diagram_properties_dialog_set_diagram (DiaDiagramPropertiesDialog *self,
-                                           Diagram                    *diagram)
+gboolean
+app_exit (void)
 {
-  DiaDiagramPropertiesDialogPrivate *priv;
-  gchar *title;
-  gchar *name;
+  GList *list;
+  GSList *slist;
 
-  g_return_if_fail (DIA_IS_DIAGRAM_PROPERTIES_DIALOG (self));
+  /*
+   * The following "solves" a crash related to a second call of app_exit,
+   * after gtk_main_quit was called. It may be a win32 gtk-1.3.x bug only
+   * but the check shouldn't hurt on *ix either.          --hb
+   */
+  static gboolean app_exit_once = FALSE;
 
-  priv = dia_diagram_properties_dialog_get_instance_private (self);
-
-  if (priv->diagram) {
-    g_object_weak_unref (G_OBJECT (priv->diagram), diagram_died, self);
-    priv->diagram = NULL;
+  if (app_exit_once) {
+    g_error (_("This shouldn't happen.  Please file a bug report at "
+               "https://gitlab.gnome.org/GNOME/dia "
+               "describing how you caused this message to appear."));
+    return FALSE;
   }
 
-  if (diagram == NULL) {
-    gtk_window_set_title (GTK_WINDOW (self), _("Diagram Properties"));
+  if (diagram_modified_exists()) {
+    if (is_integrated_ui ()) {
+      DiaExitDialog *dialog;
+      int            result;
+      GPtrArray     *items  = NULL;
+      GList         *diagrams;
+      Diagram       *diagram;
 
-    gtk_widget_set_sensitive (GTK_WIDGET (self), FALSE);
+      dialog = dia_exit_dialog_new (GTK_WINDOW (interface_get_toolbox_shell ()));
 
-    return;
+      diagrams = dia_open_diagrams ();
+      while (diagrams) {
+        diagram = diagrams->data;
+
+        if (diagram_is_modified (diagram)) {
+          const char *name = diagram_get_name (diagram);
+          const char *path = diagram->filename;
+          dia_exit_dialog_add_item (dialog, name, path, diagram);
+        }
+
+        diagrams = g_list_next (diagrams);
+      }
+
+      result = dia_exit_dialog_run (dialog, &items);
+
+      g_clear_object (&dialog);
+
+      if (result == DIA_EXIT_DIALOG_CANCEL) {
+        return FALSE;
+      } else if (result == DIA_EXIT_DIALOG_SAVE) {
+        DiaContext *ctx = dia_context_new (_("Save"));
+
+        for (int i = 0; i < items->len; i++) {
+          DiaExitDialogItem *item = g_ptr_array_index (items, i);
+          char *filename;
+
+          filename = g_filename_from_utf8 (item->data->filename, -1, NULL, NULL, NULL);
+          diagram_update_extents (item->data);
+          dia_context_set_filename (ctx, filename);
+
+          if (!diagram_save (item->data, filename, ctx)) {
+            dia_context_release (ctx);
+
+            g_clear_pointer (&filename, g_free);
+            g_clear_pointer (&items, g_ptr_array_unref);
+
+            return FALSE;
+          } else {
+            dia_context_reset (ctx);
+          }
+
+          g_clear_pointer (&filename, g_free);
+        }
+
+        dia_context_release (ctx);
+      } else if (result == DIA_EXIT_DIALOG_QUIT) {
+        diagrams = dia_open_diagrams ();
+        while (diagrams) {
+          diagram = diagrams->data;
+
+          /* slight hack: don't ask again */
+          diagram_set_modified (diagram, FALSE);
+          undo_clear (diagram->undo);
+          diagrams = g_list_next (diagrams);
+        }
+      }
+
+      g_clear_pointer (&items, g_ptr_array_unref);
+    } else {
+      GtkWidget *dialog;
+      GtkWidget *button;
+      dialog = gtk_message_dialog_new (NULL,
+                                       GTK_DIALOG_MODAL,
+                                       GTK_MESSAGE_QUESTION,
+                                       GTK_BUTTONS_NONE, /* no standard buttons */
+                                       _("Quitting without saving modified diagrams"));
+      gtk_message_dialog_format_secondary_text (GTK_MESSAGE_DIALOG (dialog),
+                                                _("Modified diagrams exist. "
+                                                  "Are you sure you want to "
+                                                  "quit Dia without saving them?"));
+
+      gtk_window_set_title (GTK_WINDOW (dialog), _("Quit Dia"));
+
+      button = gtk_button_new_with_mnemonic (_("_Cancel"));
+      gtk_dialog_add_action_widget (GTK_DIALOG (dialog), button, GTK_RESPONSE_CANCEL);
+      gtk_widget_set_can_default (GTK_WIDGET (button), TRUE);
+      gtk_dialog_set_default_response (GTK_DIALOG (dialog), GTK_RESPONSE_CANCEL);
+
+      button = gtk_button_new_with_mnemonic (_("_Quit"));
+      gtk_dialog_add_action_widget (GTK_DIALOG (dialog), button, GTK_RESPONSE_OK);
+
+      gtk_widget_show_all (dialog);
+
+      if (gtk_dialog_run (GTK_DIALOG (dialog)) != GTK_RESPONSE_OK) {
+        gtk_widget_destroy (dialog);
+        return FALSE;
+      }
+      gtk_widget_destroy (dialog);
+    }
   }
 
-  gtk_widget_set_sensitive (GTK_WIDGET (self), TRUE);
+  persistence_save ();
 
-  g_object_weak_ref (G_OBJECT (diagram), diagram_died, self);
-  priv->diagram = diagram;
+  dynobj_refresh_finish ();
 
-  name = diagram ? diagram_get_name (diagram) : NULL;
+  {
+    DiaContext *ctx = dia_context_new (_("Exit"));
+    dia_object_defaults_save (NULL, ctx);
+    dia_context_release (ctx);
+  }
+  /* Free loads of stuff (toolbox) */
 
-  /* Can we be sure that the filename is the 'proper title'? */
-  title = g_strdup_printf ("%s", name ? name : _("Diagram Properties"));
-  gtk_window_set_title (GTK_WINDOW (self), title);
+  list = dia_open_diagrams ();
+  while (list != NULL) {
+    Diagram *dia = (Diagram *) list->data;
+    list = g_list_next (list);
 
-  g_clear_pointer (&name, g_free);
-  g_clear_pointer (&title, g_free);
+    slist = dia->displays;
+    while (slist != NULL) {
+      DDisplay *ddisp = (DDisplay *) slist->data;
+      slist = g_slist_next (slist);
 
-  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (priv->dynamic),
-                                diagram->grid.dynamic);
-
-  gtk_adjustment_set_value (priv->spacing_x, diagram->grid.width_x);
-  gtk_adjustment_set_value (priv->spacing_y, diagram->grid.width_y);
-  gtk_adjustment_set_value (priv->vis_spacing_x, diagram->grid.visible_x);
-  gtk_adjustment_set_value (priv->vis_spacing_y, diagram->grid.visible_y);
-
-  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (priv->hex),
-                                diagram->grid.hex);
-
-  gtk_adjustment_set_value (priv->hex_size, diagram->grid.hex_size);
-
-  dia_colour_selector_set_colour (DIA_COLOUR_SELECTOR (priv->background),
-                                  &diagram->data->bg_color);
-  dia_colour_selector_set_colour (DIA_COLOUR_SELECTOR (priv->grid_lines),
-                                  &diagram->grid.colour);
-  dia_colour_selector_set_colour (DIA_COLOUR_SELECTOR (priv->page_lines),
-                                  &diagram->pagebreak_color);
-  dia_colour_selector_set_colour (DIA_COLOUR_SELECTOR (priv->guide_lines),
-                                  &diagram->guide_color);
-
-  update_sensitivity (GTK_TOGGLE_BUTTON (priv->dynamic), self);
-
-  g_object_notify_by_pspec (G_OBJECT (self), pspecs[PROP_DIAGRAM]);
-}
-
-
-Diagram *
-dia_diagram_properties_dialog_get_diagram (DiaDiagramPropertiesDialog *self)
-{
-  DiaDiagramPropertiesDialogPrivate *priv;
-
-  g_return_val_if_fail (DIA_IS_DIAGRAM_PROPERTIES_DIALOG (self), NULL);
-
-  priv = dia_diagram_properties_dialog_get_instance_private (self);
-
-  return priv->diagram;
-}
-
-
-DiaDiagramPropertiesDialog *
-dia_diagram_properties_dialog_get_default (void)
-{
-  static DiaDiagramPropertiesDialog *instance;
-
-  if (instance == NULL) {
-    instance = g_object_new (DIA_TYPE_DIAGRAM_PROPERTIES_DIALOG,
-                             "title", _("Diagram Properties"),
-                             NULL);
-    g_object_add_weak_pointer (G_OBJECT (instance), (gpointer *) &instance);
+      gtk_widget_destroy (ddisp->shell);
+    }
+    /* The diagram is freed when the last display is destroyed */
   }
 
-  return instance;
+  /* save pluginrc */
+  if (dia_is_interactive) {
+    dia_pluginrc_write ();
+  }
+
+  gtk_main_quit ();
+
+  /* This printf seems to prevent a race condition with unrefs. */
+  /* Yuck.  -Lars */
+  /* Trying to live without it. -Lars 10/8/07*/
+  /* g_print(_("Thank you for using Dia.\n")); */
+  app_exit_once = TRUE;
+
+  return TRUE;
 }
 
-
-void
-diagram_properties_show(Diagram *dia)
+static void
+create_user_dirs (void)
 {
-  DiaDiagramPropertiesDialog *dialog = dia_diagram_properties_dialog_get_default ();
+  gchar *dir, *subdir;
 
-  dia_diagram_properties_dialog_set_diagram (dialog, dia);
+#ifdef G_OS_WIN32
+  /* not necessary to quit the program with g_error, everywhere else
+   * dia_config_filename appears to be used. Spit out a warning ...
+   */
+  if (!g_get_home_dir ()) {
+    g_warning (_("Could not create per-user Dia configuration directory"));
+    return; /* ... and return. Probably removes my one and only FAQ. --HB */
+  }
+#endif
+  dir = g_strconcat (g_get_home_dir (), G_DIR_SEPARATOR_S ".dia", NULL);
+  if (g_mkdir (dir, 0755) && errno != EEXIST) {
+#ifndef G_OS_WIN32
+    g_critical (_("Could not create per-user Dia configuration directory"));
+    exit (1);
+#else /* HB: it this really a reason to exit the program on *nix ? */
+    g_warning (_("Could not create per-user Dia configuration directory. Please make "
+                 "sure that the environment variable HOME points to an existing directory."));
+#endif
+  }
 
-  gtk_window_set_transient_for (GTK_WINDOW (dialog),
-                                GTK_WINDOW (ddisplay_active()->shell));
-  gtk_widget_show (GTK_WIDGET (dialog));
+  /* it is no big deal if these directories can't be created */
+  subdir = g_strconcat (dir, G_DIR_SEPARATOR_S "objects", NULL);
+  g_mkdir (subdir, 0755);
+  g_clear_pointer (&subdir, g_free);
+  subdir = g_strconcat (dir, G_DIR_SEPARATOR_S "shapes", NULL);
+  g_mkdir (subdir, 0755);
+  g_clear_pointer (&subdir, g_free);
+  subdir = g_strconcat (dir, G_DIR_SEPARATOR_S "sheets", NULL);
+  g_mkdir (subdir, 0755);
+  g_clear_pointer (&subdir, g_free);
+
+  g_clear_pointer (&dir, g_free);
+}
+
+static PluginInitResult
+internal_plugin_init (PluginInfo *info)
+{
+  if (!dia_plugin_info_init (info,
+                             "Internal",
+                             _("Objects and filters internal to Dia"),
+                             NULL,
+                             NULL)) {
+    return DIA_PLUGIN_INIT_ERROR;
+  }
+
+  /* register the group object type */
+  object_register_type (&group_type);
+
+  /* register import filters */
+  filter_register_import (&dia_import_filter);
+
+  /* register export filters */
+  /* Standard Dia format */
+  filter_register_export (&dia_export_filter);
+
+  return DIA_PLUGIN_INIT_OK;
+}
+
+static gboolean
+handle_all_diagrams (GSList     *files,
+                     char       *export_file_name,
+                     char       *export_file_format,
+                     char       *size,
+                     char       *show_layers,
+                     const char *input_dir,
+                     const char *output_dir)
+{
+  GSList *node = NULL;
+  gboolean made_conversions = FALSE;
+
+  for (node = files; node; node = node->next) {
+    gchar *inpath = input_dir ? g_build_filename (input_dir, node->data, NULL) : node->data;
+    made_conversions |=
+      handle_initial_diagram (inpath,
+                              export_file_name,
+                              export_file_format,
+                              size,
+                              show_layers,
+                              output_dir);
+    if (inpath != node->data) {
+      g_clear_pointer (&inpath, g_free);
+    }
+  }
+  return made_conversions;
+}
+
+/* --credits option. Added by Andrew Ferrier.
+
+   Hopefully we're not ignoring anything too crucial by
+   quitting directly after the credits.
+
+   The phrasing of the English here might need changing
+   if we switch from plural to non-plural (say, only
+   one maintainer).
+*/
+static void
+print_credits (void)
+{
+  int i;
+  const int nauthors = (sizeof (authors) / sizeof (authors[0])) - 1;
+  const int ndocumentors = (sizeof (documentors) / sizeof (documentors[0])) - 1;
+
+  g_print (_("The original author of Dia was:\n\n"));
+  for (i = 0; i < NUMBER_OF_ORIG_AUTHORS; i++) {
+    g_print ("%s\n", authors[i]);
+  }
+
+  g_print (_("\nThe current maintainers of Dia are:\n\n"));
+  for (i = NUMBER_OF_ORIG_AUTHORS; i < NUMBER_OF_ORIG_AUTHORS + NUMBER_OF_MAINTAINERS; i++) {
+    g_print ("%s\n", authors[i]);
+  }
+
+  g_print (_("\nOther authors are:\n\n"));
+  for (i = NUMBER_OF_ORIG_AUTHORS + NUMBER_OF_MAINTAINERS; i < nauthors; i++) {
+    g_print ("%s\n", authors[i]);
+  }
+
+  g_print (_("\nDia is documented by:\n\n"));
+  for (i = 0; i < ndocumentors; i++) {
+    g_print ("%s\n", documentors[i]);
+  }
+}
+
+typedef struct _PairExtensionFilter PairExtensionFilter;
+struct _PairExtensionFilter {
+  const char *ext;
+  const DiaExportFilter *ef;
+};
+
+static int
+_cmp_filter (const void *a, const void *b)
+{
+  const PairExtensionFilter *pa = a;
+  const PairExtensionFilter *pb = b;
+
+  return strcmp (pa->ext, pb->ext);
+}
+
+/*!
+ * \brief Dump available export filters
+ *
+ * Almost all of Dia's export formats are realized with plug-ins, either
+ * implemented in C or Python. Instead of a static help string which tries
+ * to cover these at compile time, this function queries the registered
+ * filters to proide the complete list for the current configuration.
+ *
+ * This list still might not cover all available filters for two reasons:
+ *  - only configured filters are registered
+ *  - some filters are only registered for the interactive (or X11) case
+ */
+static void
+print_filters_list (gboolean verbose)
+{
+  GList *list;
+  int j;
+  GArray *by_extension;
+
+  g_print ("%s\n", _("Available Export Filters (for --filter)"));
+  g_print ("%10s%20s %s\n",
+           /* Translators: be brief or mess up the table for --list-filters */
+           _("Extension"),
+           _("Identifier"),
+           _("Description"));
+  by_extension = g_array_new (FALSE, FALSE, sizeof (PairExtensionFilter));
+  for (list = filter_get_export_filters (); list != NULL; list = list->next) {
+    const DiaExportFilter *ef = list->data;
+
+    if (!ef->extensions) {
+      continue;
+    }
+
+    for (j = 0; ef->extensions[j] != NULL; ++j) {
+      PairExtensionFilter pair = { ef->extensions[j], ef };
+
+      g_array_append_val (by_extension, pair);
+      if (!verbose) {
+        break; /* additional extensions don't provide significant information */
+      }
+    }
+  }
+  g_array_sort (by_extension, _cmp_filter);
+  for (j = 0; j < by_extension->len; ++j) {
+    PairExtensionFilter *pair = &g_array_index (by_extension, PairExtensionFilter, j);
+
+    g_print ("%10s%20s %s\n",
+             pair->ext,
+             pair->ef->unique_name ? pair->ef->unique_name : "",
+             pair->ef->description);
+  }
+  g_array_free (by_extension, TRUE);
 }
